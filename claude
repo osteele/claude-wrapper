@@ -1,0 +1,756 @@
+#!/bin/bash
+#
+# Claude wrapper script
+# Intercepts --provider, --model, --profile flags and config subcommands
+# to configure Claude for different API providers (Anthropic, OpenRouter)
+#
+
+set -euo pipefail
+
+# Configuration paths
+CONFIG_DIR="$HOME/.config/claude-wrapper"
+PROFILES_DIR="$CONFIG_DIR/profiles"
+GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
+OLD_CONFIG_FILE="$HOME/.config/claude-wrapper.toml"
+SCRIPT_PATH="$(realpath "$0")"
+OPENROUTER_SECRETS_DIR="$CONFIG_DIR/secrets/openrouter"
+MOONSHOT_SECRETS_DIR="$CONFIG_DIR/secrets/moonshot"
+
+# Valid providers
+VALID_PROVIDERS="anthropic openrouter moonshot"
+
+#------------------------------------------------------------------------------
+# Utility Functions
+#------------------------------------------------------------------------------
+
+# Find the real claude binary (skip this wrapper)
+find_real_claude() {
+    local found=""
+    while IFS= read -r path; do
+        if [[ "$(realpath "$path")" != "$SCRIPT_PATH" ]]; then
+            found="$path"
+            break
+        fi
+    done < <(which -a claude 2>/dev/null)
+
+    if [[ -z "$found" ]]; then
+        echo "Error: Could not find real claude binary" >&2
+        exit 1
+    fi
+    echo "$found"
+}
+
+# Ensure config directories exist
+ensure_config_dirs() {
+    mkdir -p "$PROFILES_DIR"
+}
+
+# Ensure OpenRouter secret directory exists
+ensure_openrouter_secret_dir() {
+    mkdir -p "$OPENROUTER_SECRETS_DIR"
+}
+
+# Migrate old config format to new structure
+migrate_config() {
+    if [[ -f "$OLD_CONFIG_FILE" && ! -f "$PROFILES_DIR/default.toml" ]]; then
+        ensure_config_dirs
+        mv "$OLD_CONFIG_FILE" "$PROFILES_DIR/default.toml"
+        echo "[settings]" > "$GLOBAL_CONFIG"
+        echo 'default_profile = "default"' >> "$GLOBAL_CONFIG"
+    fi
+}
+# Get profile file path
+get_profile_path() {
+    local profile_name="${1:-default}"
+    echo "$PROFILES_DIR/$profile_name.toml"
+}
+
+# Read a setting from a TOML file
+read_toml_setting() {
+    local file="$1"
+    local key="$2"
+    if [[ -f "$file" ]]; then
+        grep -E "^${key}[[:space:]]*=" "$file" 2>/dev/null | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/' | head -1 || true
+    fi
+}
+
+# Read and trim a secret file
+read_secret_file() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        tr -d '\r\n' < "$file"
+    fi
+}
+
+# Write a setting to a profile TOML file
+write_profile_setting() {
+    local profile_name="$1"
+    local key="$2"
+    local value="$3"
+    local profile_path
+    profile_path=$(get_profile_path "$profile_name")
+
+    ensure_config_dirs
+
+    # Create file with header if it doesn't exist
+    if [[ ! -f "$profile_path" ]]; then
+        echo "[settings]" > "$profile_path"
+    fi
+
+    # Check if key exists and update, or append
+    if grep -q "^${key}[[:space:]]*=" "$profile_path" 2>/dev/null; then
+        # Update existing key (macOS compatible sed)
+        sed -i '' "s|^${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$profile_path"
+    else
+        echo "${key} = \"${value}\"" >> "$profile_path"
+    fi
+}
+
+# Write OpenRouter key into the secrets directory
+write_openrouter_secret_file() {
+    local profile_name="$1"
+    local secret_value="$2"
+
+    ensure_config_dirs
+    ensure_openrouter_secret_dir
+
+    local secret_file="$OPENROUTER_SECRETS_DIR/$profile_name.key"
+    local current_umask
+    current_umask=$(umask)
+    umask 077
+    # Use printf to avoid adding trailing newline
+    printf "%s" "$secret_value" > "$secret_file"
+    umask "$current_umask"
+    chmod 600 "$secret_file" 2>/dev/null || true
+
+    echo "$secret_file"
+}
+
+write_moonshot_secret_file() {
+    local profile_name="$1"
+    local secret_value="$2"
+
+    ensure_config_dirs
+    ensure_moonshot_secret_dir
+
+    local secret_file="$MOONSHOT_SECRETS_DIR/$profile_name.key"
+    local current_umask
+    current_umask=$(umask)
+    umask 077
+    printf "%s" "$secret_value" > "$secret_file"
+    umask "$current_umask"
+    chmod 600 "$secret_file" 2>/dev/null || true
+
+    echo "$secret_file"
+}
+
+# Get the default profile name from global config
+get_default_profile() {
+    local profile
+    profile=$(read_toml_setting "$GLOBAL_CONFIG" "default_profile")
+    echo "${profile:-default}"
+}
+
+# Set the default profile in global config
+set_default_profile() {
+    local profile_name="$1"
+    ensure_config_dirs
+    echo "[settings]" > "$GLOBAL_CONFIG"
+    echo "default_profile = \"$profile_name\"" >> "$GLOBAL_CONFIG"
+}
+
+# List all available profiles
+list_profiles() {
+    if [[ -d "$PROFILES_DIR" ]]; then
+        for f in "$PROFILES_DIR"/*.toml; do
+            [[ -f "$f" ]] && basename "$f" .toml
+        done
+    fi
+}
+
+# Check if a profile exists
+profile_exists() {
+    local profile_name="$1"
+    [[ -f "$(get_profile_path "$profile_name")" ]]
+}
+
+# Parse ad-hoc profile spec (provider:model or just provider)
+# Sets global variables: PARSED_PROVIDER and PARSED_MODEL
+parse_profile_spec() {
+    local spec="$1"
+
+    if [[ "$spec" == *:* ]]; then
+        PARSED_PROVIDER="${spec%%:*}"
+        PARSED_MODEL="${spec#*:}"
+    else
+        PARSED_PROVIDER="$spec"
+        PARSED_MODEL=""
+    fi
+}
+
+# Check if spec is a valid provider (for ad-hoc detection)
+is_valid_provider() {
+    local provider="$1"
+    [[ " $VALID_PROVIDERS " == *" $provider "* ]]
+}
+
+#------------------------------------------------------------------------------
+# Provider Setup
+#------------------------------------------------------------------------------
+
+# Resolve the OpenRouter API key from env/config/secrets
+resolve_openrouter_api_key() {
+    local profile_name="$1"
+    local profile_path="$2"
+
+    if [[ -n "${CLAUDE_OPENROUTER_API_KEY:-}" ]]; then
+        echo "$CLAUDE_OPENROUTER_API_KEY"
+        return 0
+    fi
+
+    local inline_key
+    inline_key=$(read_toml_setting "$profile_path" "openrouter_api_key")
+    if [[ -n "$inline_key" ]]; then
+        echo "$inline_key"
+        return 0
+    fi
+
+    local configured_file
+    configured_file=$(read_toml_setting "$profile_path" "openrouter_api_key_file")
+    if [[ -n "$configured_file" && -f "$configured_file" ]]; then
+        local value
+        value=$(read_secret_file "$configured_file")
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    local default_secret_file="$OPENROUTER_SECRETS_DIR/$profile_name.key"
+    if [[ -f "$default_secret_file" ]]; then
+        local value
+        value=$(read_secret_file "$default_secret_file")
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+        echo "$OPENROUTER_API_KEY"
+        return 0
+    fi
+
+    echo ""
+}
+
+# Resolve Moonshot API key from env/config/secrets
+resolve_moonshot_api_key() {
+    local profile_name="$1"
+    local profile_path="$2"
+
+    if [[ -n "${CLAUDE_MOONSHOT_API_KEY:-}" ]]; then
+        echo "$CLAUDE_MOONSHOT_API_KEY"
+        return 0
+    fi
+
+    # Support legacy Moonshot env var spelling to ease migration
+    if [[ -n "${CLAUDE_MOONSHOOT_API_KEY:-}" ]]; then
+        echo "$CLAUDE_MOONSHOOT_API_KEY"
+        return 0
+    fi
+
+    local inline_key
+    inline_key=$(read_toml_setting "$profile_path" "moonshot_api_key")
+    if [[ -n "$inline_key" ]]; then
+        echo "$inline_key"
+        return 0
+    fi
+
+    local configured_file
+    configured_file=$(read_toml_setting "$profile_path" "moonshot_api_key_file")
+    if [[ -n "$configured_file" && -f "$configured_file" ]]; then
+        local value
+        value=$(read_secret_file "$configured_file")
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    local default_secret_file="$MOONSHOT_SECRETS_DIR/$profile_name.key"
+    if [[ -f "$default_secret_file" ]]; then
+        local value
+        value=$(read_secret_file "$default_secret_file")
+        if [[ -n "$value" ]]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    if [[ -n "${MOONSHOT_API_KEY:-}" ]]; then
+        echo "$MOONSHOT_API_KEY"
+        return 0
+    fi
+
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        echo "$ANTHROPIC_API_KEY"
+        return 0
+    fi
+
+    echo ""
+}
+
+# Set environment for OpenRouter
+setup_openrouter() {
+    local api_key="${1:-}"
+    if [[ -z "$api_key" ]]; then
+        echo "Error: OpenRouter API key is not configured" >&2
+        echo "Set CLAUDE_OPENROUTER_API_KEY, configure a profile secret, or export OPENROUTER_API_KEY." >&2
+        exit 1
+    fi
+    export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+    export ANTHROPIC_AUTH_TOKEN="$api_key"
+    export ANTHROPIC_API_KEY=""
+}
+
+setup_moonshot() {
+    local api_key="${1:-}"
+    if [[ -z "$api_key" ]]; then
+        echo "Error: Moonshot API key is not configured" >&2
+        echo "Set CLAUDE_MOONSHOT_API_KEY, configure a profile secret, or export MOONSHOT_API_KEY." >&2
+        exit 1
+    fi
+    export ANTHROPIC_BASE_URL="https://api.moonshot.cn/anthropic/"
+    export ANTHROPIC_API_KEY="$api_key"
+    unset ANTHROPIC_AUTH_TOKEN
+}
+
+#------------------------------------------------------------------------------
+# Config Command Handlers
+#------------------------------------------------------------------------------
+
+# Handle 'config show' command
+handle_config_show() {
+    local current_profile
+    current_profile=$(get_default_profile)
+    local profile_path
+    profile_path=$(get_profile_path "$current_profile")
+
+    local provider model
+    provider=$(read_toml_setting "$profile_path" "provider")
+    model=$(read_toml_setting "$profile_path" "model")
+
+    echo "Profile:    ${current_profile}"
+    echo "Provider:   ${provider:-anthropic}"
+    echo "Model:      ${model:-(default)}"
+    echo "Config dir: $CONFIG_DIR"
+    echo "Real binary: $(find_real_claude)"
+}
+
+# Handle 'config profile' subcommands
+handle_config_profile() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: claude config profile <list|create|delete|use|show> [name]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        list)
+            local default_profile
+            default_profile=$(get_default_profile)
+            for profile in $(list_profiles); do
+                if [[ "$profile" == "$default_profile" ]]; then
+                    echo "$profile (default)"
+                else
+                    echo "$profile"
+                fi
+            done
+            ;;
+        create)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config profile create <name>" >&2
+                exit 1
+            fi
+            local name="$1"
+            local profile_path
+            profile_path=$(get_profile_path "$name")
+            if [[ -f "$profile_path" ]]; then
+                echo "Profile '$name' already exists" >&2
+                exit 1
+            fi
+            ensure_config_dirs
+            echo "[settings]" > "$profile_path"
+            echo "Created profile: $name"
+            ;;
+        delete)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config profile delete <name>" >&2
+                exit 1
+            fi
+            local name="$1"
+            if [[ "$name" == "default" ]]; then
+                echo "Cannot delete the default profile" >&2
+                exit 1
+            fi
+            local profile_path
+            profile_path=$(get_profile_path "$name")
+            if [[ ! -f "$profile_path" ]]; then
+                echo "Profile '$name' does not exist" >&2
+                exit 1
+            fi
+            rm "$profile_path"
+            echo "Deleted profile: $name"
+            ;;
+        use)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config profile use <name>" >&2
+                exit 1
+            fi
+            local name="$1"
+            if ! profile_exists "$name"; then
+                echo "Profile '$name' does not exist" >&2
+                exit 1
+            fi
+            set_default_profile "$name"
+            echo "Now using profile: $name"
+            ;;
+        show)
+            local name="${1:-$(get_default_profile)}"
+            local profile_path
+            profile_path=$(get_profile_path "$name")
+            if [[ ! -f "$profile_path" ]]; then
+                echo "Profile '$name' does not exist" >&2
+                exit 1
+            fi
+            echo "Profile: $name"
+            cat "$profile_path"
+            ;;
+        *)
+            echo "Unknown profile action: $action (valid: list, create, delete, use, show)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Handle config subcommand
+handle_config() {
+    shift  # Remove 'config'
+
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: claude config <show|get|set|profile> [args...]" >&2
+        exit 1
+    fi
+
+    local action="$1"
+    shift
+
+    # Get current profile for get/set operations
+    local current_profile
+    current_profile=$(get_default_profile)
+
+    case "$action" in
+        show)
+            handle_config_show
+            ;;
+        profile)
+            handle_config_profile "$@"
+            ;;
+        get)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config get <key>" >&2
+                exit 1
+            fi
+            local key="$1"
+            local profile_path
+            profile_path=$(get_profile_path "$current_profile")
+            case "$key" in
+                provider)
+                    local value
+                    value=$(read_toml_setting "$profile_path" "provider")
+                    echo "${value:-anthropic}"
+                    ;;
+                model)
+                    local value
+                    value=$(read_toml_setting "$profile_path" "model")
+                    echo "${value:-(default)}"
+                    ;;
+                openrouter_key)
+                    echo "OpenRouter keys cannot be displayed for security reasons." >&2
+                    exit 1
+                    ;;
+                *)
+                    echo "Unknown config key: $key (valid: provider, model, openrouter_key)" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        set)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config set <key> <value>" >&2
+                echo "Keys: provider, model, openrouter_key (supports <value>|--stdin|--file)" >&2
+                exit 1
+            fi
+            local key="$1"
+            shift
+            case "$key" in
+                provider)
+                    if [[ $# -lt 1 ]]; then
+                        echo "Usage: claude config set provider <value>" >&2
+                        exit 1
+                    fi
+                    local value="$1"
+                    if ! is_valid_provider "$value"; then
+                        echo "Unknown provider: $value (valid: $VALID_PROVIDERS)" >&2
+                        exit 1
+                    fi
+                    write_profile_setting "$current_profile" "provider" "$value"
+                    echo "Provider set to: $value"
+                    ;;
+                model)
+                    if [[ $# -lt 1 ]]; then
+                        echo "Usage: claude config set model <value>" >&2
+                        exit 1
+                    fi
+                    local value="$1"
+                    write_profile_setting "$current_profile" "model" "$value"
+                    echo "Model set to: $value"
+                    ;;
+                openrouter_key)
+                    handle_config_set_openrouter_key "$current_profile" "$@"
+                    ;;
+                *)
+                    echo "Unknown config key: $key (valid: provider, model, openrouter_key)" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Unknown config action: $action (valid: show, get, set, profile)" >&2
+            exit 1
+            ;;
+    esac
+    exit 0
+}
+
+# Handle config set openrouter_key helper
+handle_config_set_openrouter_key() {
+    local profile_name="$1"
+    shift
+
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: claude config set openrouter_key <value|--stdin|--file path>" >&2
+        exit 1
+    fi
+
+    local mode="value"
+    local value=""
+    local file_path=""
+
+    case "$1" in
+        --stdin)
+            value=$(cat | tr -d '\r\n')
+            mode="value"
+            ;;
+        --file)
+            if [[ $# -lt 2 ]]; then
+                echo "Usage: claude config set openrouter_key --file <path>" >&2
+                exit 1
+            fi
+            file_path="$2"
+            mode="file"
+            ;;
+        *)
+            value="$1"
+            mode="value"
+            ;;
+    esac
+
+    case "$mode" in
+        value)
+            if [[ -z "$value" ]]; then
+                echo "OpenRouter key cannot be empty" >&2
+                exit 1
+            fi
+            local secret_file
+            secret_file=$(write_openrouter_secret_file "$profile_name" "$value")
+            write_profile_setting "$profile_name" "openrouter_api_key_file" "$secret_file"
+            echo "Stored OpenRouter key for profile: $profile_name"
+            ;;
+        file)
+            if [[ ! -f "$file_path" ]]; then
+                echo "OpenRouter key file '$file_path' does not exist" >&2
+                exit 1
+            fi
+            write_profile_setting "$profile_name" "openrouter_api_key_file" "$file_path"
+            echo "Registered OpenRouter key file for profile: $profile_name"
+            ;;
+    esac
+}
+
+#------------------------------------------------------------------------------
+# Main Logic
+#------------------------------------------------------------------------------
+
+main() {
+    # Run migration if needed
+    migrate_config
+
+    local provider=""
+    local model=""
+    local profile=""
+    local args=()
+    local skip_next=false
+    local skip_reason=""
+
+    # Parse arguments
+    for arg in "$@"; do
+        if $skip_next; then
+            skip_next=false
+            continue
+        fi
+
+        case "$arg" in
+            --provider)
+                skip_next=true
+                # Find the provider value (next arg)
+                local found=false
+                for check_arg in "$@"; do
+                    if $found; then
+                        provider="$check_arg"
+                        break
+                    fi
+                    if [[ "$check_arg" == "--provider" ]]; then
+                        found=true
+                    fi
+                done
+                ;;
+            --provider=*)
+                provider="${arg#--provider=}"
+                ;;
+            --model)
+                skip_next=true
+                # Find the model value (next arg)
+                local found=false
+                for check_arg in "$@"; do
+                    if $found; then
+                        model="$check_arg"
+                        break
+                    fi
+                    if [[ "$check_arg" == "--model" ]]; then
+                        found=true
+                    fi
+                done
+                ;;
+            --model=*)
+                model="${arg#--model=}"
+                ;;
+            --profile)
+                skip_next=true
+                # Find the profile value (next arg)
+                local found=false
+                for check_arg in "$@"; do
+                    if $found; then
+                        profile="$check_arg"
+                        break
+                    fi
+                    if [[ "$check_arg" == "--profile" ]]; then
+                        found=true
+                    fi
+                done
+                ;;
+            --profile=*)
+                profile="${arg#--profile=}"
+                ;;
+            *)
+                args+=("$arg")
+                ;;
+        esac
+    done
+
+    # Handle config subcommand (before any provider setup)
+    if [[ ${#args[@]} -gt 0 && "${args[0]}" == "config" ]]; then
+        handle_config "${args[@]}"
+    fi
+
+    # Check environment variable overrides
+    profile="${profile:-${CLAUDE_PROFILE:-}}"
+    provider="${provider:-${CLAUDE_PROVIDER:-}}"
+    model="${model:-${CLAUDE_MODEL:-}}"
+
+    # Resolve profile (could be name or ad-hoc spec like "openrouter:model")
+    local profile_name=""
+    if [[ -n "$profile" ]]; then
+        # Check if it's an ad-hoc spec (contains a valid provider)
+        parse_profile_spec "$profile"
+
+        if is_valid_provider "$PARSED_PROVIDER"; then
+            # Ad-hoc spec: use provider/model from spec
+            provider="${provider:-$PARSED_PROVIDER}"
+            model="${model:-$PARSED_MODEL}"
+            profile_name="default"
+        elif profile_exists "$profile"; then
+            # Named profile
+            profile_name="$profile"
+        else
+            echo "Unknown profile: $profile" >&2
+            exit 1
+        fi
+    else
+        profile_name=$(get_default_profile)
+    fi
+
+    # Read settings from profile if not overridden
+    local profile_path
+    profile_path=$(get_profile_path "$profile_name")
+
+    if [[ -z "$provider" ]]; then
+        provider=$(read_toml_setting "$profile_path" "provider")
+    fi
+    provider="${provider:-anthropic}"
+
+    if [[ -z "$model" ]]; then
+        model=$(read_toml_setting "$profile_path" "model")
+    fi
+
+    # Validate provider
+    if ! is_valid_provider "$provider"; then
+        echo "Unknown provider: $provider (valid: $VALID_PROVIDERS)" >&2
+        exit 1
+    fi
+
+    local openrouter_api_key=""
+    if [[ "$provider" == "openrouter" ]]; then
+        openrouter_api_key=$(resolve_openrouter_api_key "$profile_name" "$profile_path")
+    fi
+
+    # Setup environment based on provider
+    case "$provider" in
+        openrouter)
+            setup_openrouter "$openrouter_api_key"
+            ;;
+        anthropic)
+            # Default behavior, no changes needed
+            ;;
+    esac
+
+    # Build final command args
+    local final_args=()
+    if [[ -n "$model" ]]; then
+        final_args+=("--model" "$model")
+    fi
+    # Add remaining args
+    if [[ ${#args[@]} -gt 0 ]]; then
+        final_args+=("${args[@]}")
+    fi
+
+    # Find and exec the real claude
+    local real_claude
+    real_claude=$(find_real_claude)
+    exec "$real_claude" ${final_args[@]+"${final_args[@]}"}
+}
+
+main "$@"
