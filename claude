@@ -174,7 +174,7 @@ profile_exists() {
     [[ -f "$(get_profile_path "$profile_name")" ]]
 }
 
-# Parse ad-hoc profile spec (provider:model or just provider)
+# Parse ad-hoc profile spec (provider:model)
 # Sets global variables: PARSED_PROVIDER and PARSED_MODEL
 parse_profile_spec() {
     local spec="$1"
@@ -182,13 +182,15 @@ parse_profile_spec() {
     if [[ "$spec" == *:* ]]; then
         PARSED_PROVIDER="${spec%%:*}"
         PARSED_MODEL="${spec#*:}"
-    else
-        PARSED_PROVIDER="$spec"
-        PARSED_MODEL=""
+        return 0
     fi
+
+    PARSED_PROVIDER=""
+    PARSED_MODEL=""
+    return 1
 }
 
-# Check if spec is a valid provider (for ad-hoc detection)
+# Check if spec is a valid provider
 is_valid_provider() {
     local provider="$1"
     [[ " $VALID_PROVIDERS " == *" $provider "* ]]
@@ -720,13 +722,15 @@ main() {
     # Resolve profile (could be name or ad-hoc spec like "openrouter:model")
     local profile_name=""
     if [[ -n "$profile" ]]; then
-        # Check if it's an ad-hoc spec (contains a valid provider)
-        parse_profile_spec "$profile"
-
-        if is_valid_provider "$PARSED_PROVIDER"; then
-            # Ad-hoc spec: use provider/model from spec
+        if parse_profile_spec "$profile"; then
+            if ! is_valid_provider "$PARSED_PROVIDER"; then
+                echo "Unknown provider: $PARSED_PROVIDER (valid: $VALID_PROVIDERS)" >&2
+                exit 1
+            fi
             provider="${provider:-$PARSED_PROVIDER}"
-            model="${model:-$PARSED_MODEL}"
+            if [[ -z "$model" && -n "$PARSED_MODEL" ]]; then
+                model="$PARSED_MODEL"
+            fi
             profile_name="default"
         elif profile_exists "$profile"; then
             # Named profile
