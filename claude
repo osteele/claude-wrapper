@@ -195,9 +195,40 @@ is_valid_provider() {
 }
 
 #------------------------------------------------------------------------------
-# Provider Setup
+# Provider Setup / Help
 #------------------------------------------------------------------------------
 
+print_wrapper_help() {
+    cat <<EOF
+
+Claude Wrapper Help
+-------------------
+Profiles:
+  --profile <name>          Use a stored profile (default set via 'claude config profile use')
+  CLAUDE_PROFILE            Environment override for the profile
+
+Providers:
+  --provider <anthropic|openrouter>  Override provider for this invocation
+  CLAUDE_PROVIDER                     Environment override
+
+Models:
+  --model <model_id>        Override model flag; CLAUDE_MODEL does the same
+
+Config management:
+  claude config show|get|set|profile ...
+    - 'claude config set provider <name>' changes the provider on the current profile
+    - 'claude config set openrouter_key <value|--stdin|--file>' stores a profile-specific
+      OpenRouter key under $OPENROUTER_SECRETS_DIR
+
+OpenRouter keys are resolved in this order:
+  1. CLAUDE_OPENROUTER_API_KEY
+  2. 'openrouter_api_key' or 'openrouter_api_key_file' in the active profile
+  3. $OPENROUTER_SECRETS_DIR/<profile>.key (managed by 'claude config set openrouter_key')
+  4. OPENROUTER_API_KEY
+
+Config files live under $CONFIG_DIR (profiles stored in $PROFILES_DIR).
+EOF
+}
 # Resolve the OpenRouter API key from env/config/secrets
 resolve_openrouter_api_key() {
     local profile_name="$1"
@@ -605,6 +636,7 @@ main() {
     local args=()
     local skip_next=false
     local skip_reason=""
+    local help_requested=false
 
     # Parse arguments
     for arg in "$@"; do
@@ -664,6 +696,10 @@ main() {
                 ;;
             --profile=*)
                 profile="${arg#--profile=}"
+                ;;
+            --help|-h)
+                help_requested=true
+                args+=("$arg")
                 ;;
             *)
                 args+=("$arg")
@@ -730,7 +766,9 @@ main() {
     # Setup environment based on provider
     case "$provider" in
         openrouter)
-            setup_openrouter "$openrouter_api_key"
+            if [[ "$help_requested" != true ]]; then
+                setup_openrouter "$openrouter_api_key"
+            fi
             ;;
         anthropic)
             # Default behavior, no changes needed
@@ -750,6 +788,13 @@ main() {
     # Find and exec the real claude
     local real_claude
     real_claude=$(find_real_claude)
+    if [[ "$help_requested" == true ]]; then
+        "$real_claude" ${final_args[@]+"${final_args[@]}"}
+        local status=$?
+        print_wrapper_help
+        exit $status
+    fi
+
     exec "$real_claude" ${final_args[@]+"${final_args[@]}"}
 }
 
