@@ -11,7 +11,6 @@ set -euo pipefail
 CONFIG_DIR="$HOME/.config/claude-wrapper"
 PROFILES_DIR="$CONFIG_DIR/profiles"
 GLOBAL_CONFIG="$CONFIG_DIR/config.toml"
-OLD_CONFIG_FILE="$HOME/.config/claude-wrapper.toml"
 SCRIPT_PATH="$(realpath "$0")"
 OPENROUTER_SECRETS_DIR="$CONFIG_DIR/secrets/openrouter"
 MOONSHOT_SECRETS_DIR="$CONFIG_DIR/secrets/moonshot"
@@ -50,15 +49,7 @@ ensure_openrouter_secret_dir() {
     mkdir -p "$OPENROUTER_SECRETS_DIR"
 }
 
-# Migrate old config format to new structure
-migrate_config() {
-    if [[ -f "$OLD_CONFIG_FILE" && ! -f "$PROFILES_DIR/default.toml" ]]; then
-        ensure_config_dirs
-        mv "$OLD_CONFIG_FILE" "$PROFILES_DIR/default.toml"
-        echo "[settings]" > "$GLOBAL_CONFIG"
-        echo 'default_profile = "default"' >> "$GLOBAL_CONFIG"
-    fi
-}
+
 # Get profile file path
 get_profile_path() {
     local profile_name="${1:-default}"
@@ -770,9 +761,6 @@ handle_config_set_openrouter_key() {
 #------------------------------------------------------------------------------
 
 main() {
-    # Run migration if needed
-    migrate_config
-
     local provider=""
     local model=""
     local profile=""

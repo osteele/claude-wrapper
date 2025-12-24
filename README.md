@@ -10,7 +10,6 @@ real `claude` tool still handles the heavy lifting.
 - Supports multiple profiles stored under `~/.config/claude-wrapper/profiles`
 - Ad-hoc profiles via `provider:model` syntax without touching config files
 - Convenience `config` subcommand for listing, switching, and editing profiles
-- Automatic migration from the legacy `~/.config/claude-wrapper.toml` format
 - Provider-specific environment setup (currently Anthropic and OpenRouter)
 
 ## Usage
@@ -63,7 +62,7 @@ The wrapper can use OpenRouter API keys that differ from the global
 2. `openrouter_api_key = "..."` defined directly in the active profile
 3. The file referenced by `openrouter_api_key_file` or the default
    `~/.config/claude-wrapper/secrets/openrouter/<profile>.key`
-4. The legacy `OPENROUTER_API_KEY` variable
+4. The global `OPENROUTER_API_KEY` export
 
 Use `claude config set openrouter_key <value>` to store a secret for the current
 profile inside the secrets directory above. `--stdin` reads the key from STDIN,
@@ -82,7 +81,7 @@ it.
 
 Each profile file stores simple TOML assignments such as `provider = "anthropic"`
 and `model = "claude-3-5-sonnet"`. The wrapper ensures these directories exist
-and will migrate your legacy config file into this structure on first run.
+so new setups can be created with `claude config profile create`.
 
 ## Adding to PATH
 
