@@ -2,7 +2,7 @@
 #
 # Claude wrapper script
 # Intercepts --provider, --model, --profile flags and config subcommands
-# to configure Claude for different API providers (Anthropic, OpenRouter)
+# to configure Claude for different API providers (Anthropic, OpenRouter, Moonshot)
 #
 
 set -euo pipefail
@@ -256,6 +256,8 @@ Config management:
     - 'claude config set extra_args "--flag1 --flag2"' appends profile-specific CLI args
     - 'claude config set openrouter_key <value|--stdin|--file>' stores a profile-specific
       OpenRouter key under $OPENROUTER_SECRETS_DIR
+    - 'claude config set moonshot_key <value|--stdin|--file>' stores a profile-specific
+      Moonshot key under $MOONSHOT_SECRETS_DIR
   Global overrides:
     - 'claude config global set extra_args "--allow-dangerously-skip-permissions"'
       appends flags to every invocation
@@ -638,8 +640,12 @@ handle_config() {
                     echo "OpenRouter keys cannot be displayed for security reasons." >&2
                     exit 1
                     ;;
+                moonshot_key)
+                    echo "Moonshot keys cannot be displayed for security reasons." >&2
+                    exit 1
+                    ;;
                 *)
-                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key)" >&2
+                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key, moonshot_key)" >&2
                     exit 1
                     ;;
             esac
@@ -647,7 +653,7 @@ handle_config() {
         set)
             if [[ $# -lt 1 ]]; then
                 echo "Usage: claude config set <key> <value>" >&2
-                echo "Keys: provider, model, extra_args, openrouter_key (supports <value>|--stdin|--file)" >&2
+                echo "Keys: provider, model, extra_args, openrouter_key, moonshot_key (support <value>|--stdin|--file)" >&2
                 exit 1
             fi
             local key="$1"
@@ -687,8 +693,11 @@ handle_config() {
                 openrouter_key)
                     handle_config_set_openrouter_key "$current_profile" "$@"
                     ;;
+                moonshot_key)
+                    handle_config_set_moonshot_key "$current_profile" "$@"
+                    ;;
                 *)
-                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key)" >&2
+                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key, moonshot_key)" >&2
                     exit 1
                     ;;
             esac
@@ -752,6 +761,60 @@ handle_config_set_openrouter_key() {
             fi
             write_profile_setting "$profile_name" "openrouter_api_key_file" "$file_path"
             echo "Registered OpenRouter key file for profile: $profile_name"
+            ;;
+    esac
+}
+
+handle_config_set_moonshot_key() {
+    local profile_name="$1"
+    shift
+
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: claude config set moonshot_key <value|--stdin|--file path>" >&2
+        exit 1
+    fi
+
+    local mode="value"
+    local value=""
+    local file_path=""
+
+    case "$1" in
+        --stdin)
+            value=$(cat | tr -d '\r\n')
+            mode="value"
+            ;;
+        --file)
+            if [[ $# -lt 2 ]]; then
+                echo "Usage: claude config set moonshot_key --file <path>" >&2
+                exit 1
+            fi
+            file_path="$2"
+            mode="file"
+            ;;
+        *)
+            value="$1"
+            mode="value"
+            ;;
+    esac
+
+    case "$mode" in
+        value)
+            if [[ -z "$value" ]]; then
+                echo "Moonshot key cannot be empty" >&2
+                exit 1
+            fi
+            local secret_file
+            secret_file=$(write_moonshot_secret_file "$profile_name" "$value")
+            write_profile_setting "$profile_name" "moonshot_api_key_file" "$secret_file"
+            echo "Stored Moonshot key for profile: $profile_name"
+            ;;
+        file)
+            if [[ ! -f "$file_path" ]]; then
+                echo "Moonshot key file '$file_path' does not exist" >&2
+                exit 1
+            fi
+            write_profile_setting "$profile_name" "moonshot_api_key_file" "$file_path"
+            echo "Registered Moonshot key file for profile: $profile_name"
             ;;
     esac
 }
@@ -896,8 +959,11 @@ main() {
     fi
 
     local openrouter_api_key=""
+    local moonshot_api_key=""
     if [[ "$provider" == "openrouter" ]]; then
         openrouter_api_key=$(resolve_openrouter_api_key "$profile_name" "$profile_path")
+    elif [[ "$provider" == "moonshot" ]]; then
+        moonshot_api_key=$(resolve_moonshot_api_key "$profile_name" "$profile_path")
     fi
 
     # Setup environment based on provider
@@ -905,6 +971,11 @@ main() {
         openrouter)
             if [[ "$help_requested" != true ]]; then
                 setup_openrouter "$openrouter_api_key"
+            fi
+            ;;
+        moonshot)
+            if [[ "$help_requested" != true ]]; then
+                setup_moonshot "$moonshot_api_key"
             fi
             ;;
         anthropic)

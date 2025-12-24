@@ -10,7 +10,7 @@ real `claude` tool still handles the heavy lifting.
 - Supports multiple profiles stored under `~/.config/claude-wrapper/profiles`
 - Ad-hoc profiles via `provider:model` syntax without touching config files
 - Convenience `config` subcommand for listing, switching, and editing profiles
-- Provider-specific environment setup (currently Anthropic and OpenRouter)
+- Provider-specific environment setup (Anthropic, OpenRouter, Moonshot)
 
 ## Usage
 
@@ -68,6 +68,21 @@ Use `claude config set openrouter_key <value>` to store a secret for the current
 profile inside the secrets directory above. `--stdin` reads the key from STDIN,
 and `--file <path>` records a pointer to an existing secret file without copying
 it.
+
+### Custom Moonshot Keys
+
+Moonshot access works the same way, with credentials resolved in the order below:
+
+1. `CLAUDE_MOONSHOT_API_KEY` (the wrapper also honors the legacy
+   `CLAUDE_MOONSHOOT_API_KEY`)
+2. `moonshot_api_key = "..."` defined in the active profile
+3. The file referenced by `moonshot_api_key_file` or the default
+   `~/.config/claude-wrapper/secrets/moonshot/<profile>.key`
+4. `MOONSHOT_API_KEY`
+5. `ANTHROPIC_API_KEY`
+
+Persisted secrets live alongside the OpenRouter ones, and can be written via
+`claude config set moonshot_key <value|--stdin|--file>`.
 
 ## Configuration Layout
 
