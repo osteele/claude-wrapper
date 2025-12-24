@@ -82,6 +82,27 @@ read_secret_file() {
     fi
 }
 
+# Write a key/value into a TOML settings file
+write_toml_setting_file() {
+    local file_path="$1"
+    local key="$2"
+    local value="$3"
+
+    local dir
+    dir=$(dirname "$file_path")
+    mkdir -p "$dir"
+
+    if [[ ! -f "$file_path" ]]; then
+        echo "[settings]" > "$file_path"
+    fi
+
+    if grep -q "^${key}[[:space:]]*=" "$file_path" 2>/dev/null; then
+        sed -i '' "s|^${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$file_path"
+    else
+        echo "${key} = \"${value}\"" >> "$file_path"
+    fi
+}
+
 # Write a setting to a profile TOML file
 write_profile_setting() {
     local profile_name="$1"
@@ -91,19 +112,15 @@ write_profile_setting() {
     profile_path=$(get_profile_path "$profile_name")
 
     ensure_config_dirs
+    write_toml_setting_file "$profile_path" "$key" "$value"
+}
 
-    # Create file with header if it doesn't exist
-    if [[ ! -f "$profile_path" ]]; then
-        echo "[settings]" > "$profile_path"
-    fi
-
-    # Check if key exists and update, or append
-    if grep -q "^${key}[[:space:]]*=" "$profile_path" 2>/dev/null; then
-        # Update existing key (macOS compatible sed)
-        sed -i '' "s|^${key}[[:space:]]*=.*|${key} = \"${value}\"|" "$profile_path"
-    else
-        echo "${key} = \"${value}\"" >> "$profile_path"
-    fi
+# Write a setting to the global config
+write_global_setting() {
+    local key="$1"
+    local value="$2"
+    ensure_config_dirs
+    write_toml_setting_file "$GLOBAL_CONFIG" "$key" "$value"
 }
 
 # Write OpenRouter key into the secrets directory
@@ -154,9 +171,7 @@ get_default_profile() {
 # Set the default profile in global config
 set_default_profile() {
     local profile_name="$1"
-    ensure_config_dirs
-    echo "[settings]" > "$GLOBAL_CONFIG"
-    echo "default_profile = \"$profile_name\"" >> "$GLOBAL_CONFIG"
+    write_global_setting "default_profile" "$profile_name"
 }
 
 # List all available profiles
@@ -196,6 +211,34 @@ is_valid_provider() {
     [[ " $VALID_PROVIDERS " == *" $provider "* ]]
 }
 
+# Split a shell-style argument string into newline-delimited tokens
+split_shell_words() {
+    local input="$1"
+    if [[ -z "$input" ]]; then
+        return
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$input" <<'PY'
+import shlex, sys
+try:
+    parts = shlex.split(sys.argv[1])
+except Exception as exc:
+    print(f"Error parsing extra args: {exc}", file=sys.stderr)
+    sys.exit(1)
+for part in parts:
+    print(part)
+PY
+        return
+    fi
+
+    # Fallback: basic whitespace split (quotes not supported)
+    local IFS=$' \t\n'
+    for token in $input; do
+        printf '%s\n' "$token"
+    done
+}
+
 #------------------------------------------------------------------------------
 # Provider Setup / Help
 #------------------------------------------------------------------------------
@@ -217,10 +260,14 @@ Models:
   --model <model_id>        Override model flag; CLAUDE_MODEL does the same
 
 Config management:
-  claude config show|get|set|profile ...
+  claude config show|get|set|profile|global ...
     - 'claude config set provider <name>' changes the provider on the current profile
+    - 'claude config set extra_args "--flag1 --flag2"' appends profile-specific CLI args
     - 'claude config set openrouter_key <value|--stdin|--file>' stores a profile-specific
       OpenRouter key under $OPENROUTER_SECRETS_DIR
+  Global overrides:
+    - 'claude config global set extra_args "--allow-dangerously-skip-permissions"'
+      appends flags to every invocation
 
 OpenRouter keys are resolved in this order:
   1. CLAUDE_OPENROUTER_API_KEY
@@ -373,12 +420,89 @@ handle_config_show() {
     local provider model
     provider=$(read_toml_setting "$profile_path" "provider")
     model=$(read_toml_setting "$profile_path" "model")
+    local global_extra
+    global_extra=$(read_toml_setting "$GLOBAL_CONFIG" "extra_args")
+    local profile_extra
+    profile_extra=$(read_toml_setting "$profile_path" "extra_args")
 
     echo "Profile:    ${current_profile}"
     echo "Provider:   ${provider:-anthropic}"
     echo "Model:      ${model:-(default)}"
+    echo "Global extra args: ${global_extra:-<none>}"
+    echo "Profile extra args: ${profile_extra:-<none>}"
     echo "Config dir: $CONFIG_DIR"
     echo "Real binary: $(find_real_claude)"
+}
+
+# Handle global config operations
+handle_config_global() {
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: claude config global <show|get|set> [...]" >&2
+        exit 1
+    fi
+
+    ensure_config_dirs
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        show)
+            if [[ -f "$GLOBAL_CONFIG" ]]; then
+                cat "$GLOBAL_CONFIG"
+            else
+                echo "(no global config yet)"
+            fi
+            ;;
+        get)
+            if [[ $# -lt 1 ]]; then
+                echo "Usage: claude config global get <key>" >&2
+                exit 1
+            fi
+            local key="$1"
+            case "$key" in
+                extra_args)
+                    local value
+                    value=$(read_toml_setting "$GLOBAL_CONFIG" "extra_args")
+                    echo "${value:-}"
+                    ;;
+                default_profile)
+                    get_default_profile
+                    ;;
+                *)
+                    echo "Unknown global config key: $key (valid: default_profile, extra_args)" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        set)
+            if [[ $# -lt 2 ]]; then
+                echo "Usage: claude config global set <key> <value>" >&2
+                exit 1
+            fi
+            local key="$1"
+            shift
+            local value="$1"
+            case "$key" in
+                extra_args)
+                    write_global_setting "extra_args" "$value"
+                    echo "Global extra args set."
+                    ;;
+                default_profile)
+                    set_default_profile "$value"
+                    echo "Default profile set to: $value"
+                    ;;
+                *)
+                    echo "Unknown global config key: $key (valid: default_profile, extra_args)" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Unknown global action: $action (valid: show, get, set)" >&2
+            exit 1
+            ;;
+    esac
 }
 
 # Handle 'config profile' subcommands
@@ -474,7 +598,7 @@ handle_config() {
     shift  # Remove 'config'
 
     if [[ $# -lt 1 ]]; then
-        echo "Usage: claude config <show|get|set|profile> [args...]" >&2
+        echo "Usage: claude config <show|get|set|profile|global> [args...]" >&2
         exit 1
     fi
 
@@ -491,6 +615,9 @@ handle_config() {
             ;;
         profile)
             handle_config_profile "$@"
+            ;;
+        global)
+            handle_config_global "$@"
             ;;
         get)
             if [[ $# -lt 1 ]]; then
@@ -511,12 +638,17 @@ handle_config() {
                     value=$(read_toml_setting "$profile_path" "model")
                     echo "${value:-(default)}"
                     ;;
+                extra_args)
+                    local value
+                    value=$(read_toml_setting "$profile_path" "extra_args")
+                    echo "${value:-}"
+                    ;;
                 openrouter_key)
                     echo "OpenRouter keys cannot be displayed for security reasons." >&2
                     exit 1
                     ;;
                 *)
-                    echo "Unknown config key: $key (valid: provider, model, openrouter_key)" >&2
+                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key)" >&2
                     exit 1
                     ;;
             esac
@@ -524,7 +656,7 @@ handle_config() {
         set)
             if [[ $# -lt 1 ]]; then
                 echo "Usage: claude config set <key> <value>" >&2
-                echo "Keys: provider, model, openrouter_key (supports <value>|--stdin|--file)" >&2
+                echo "Keys: provider, model, extra_args, openrouter_key (supports <value>|--stdin|--file)" >&2
                 exit 1
             fi
             local key="$1"
@@ -552,17 +684,26 @@ handle_config() {
                     write_profile_setting "$current_profile" "model" "$value"
                     echo "Model set to: $value"
                     ;;
+                extra_args)
+                    if [[ $# -lt 1 ]]; then
+                        echo "Usage: claude config set extra_args <value>" >&2
+                        exit 1
+                    fi
+                    local value="$1"
+                    write_profile_setting "$current_profile" "extra_args" "$value"
+                    echo "Extra args set to: $value"
+                    ;;
                 openrouter_key)
                     handle_config_set_openrouter_key "$current_profile" "$@"
                     ;;
                 *)
-                    echo "Unknown config key: $key (valid: provider, model, openrouter_key)" >&2
+                    echo "Unknown config key: $key (valid: provider, model, extra_args, openrouter_key)" >&2
                     exit 1
                     ;;
             esac
             ;;
         *)
-            echo "Unknown config action: $action (valid: show, get, set, profile)" >&2
+            echo "Unknown config action: $action (valid: show, get, set, profile, global)" >&2
             exit 1
             ;;
     esac
@@ -755,6 +896,10 @@ main() {
     if [[ -z "$model" ]]; then
         model=$(read_toml_setting "$profile_path" "model")
     fi
+    local global_extra_args
+    global_extra_args=$(read_toml_setting "$GLOBAL_CONFIG" "extra_args")
+    local profile_extra_args
+    profile_extra_args=$(read_toml_setting "$profile_path" "extra_args")
 
     # Validate provider
     if ! is_valid_provider "$provider"; then
@@ -783,6 +928,20 @@ main() {
     local final_args=()
     if [[ -n "$model" ]]; then
         final_args+=("--model" "$model")
+    fi
+    local merged_extra_args=()
+    if [[ -n "$global_extra_args" ]]; then
+        while IFS= read -r token; do
+            [[ -n "$token" ]] && merged_extra_args+=("$token")
+        done < <(split_shell_words "$global_extra_args")
+    fi
+    if [[ -n "$profile_extra_args" ]]; then
+        while IFS= read -r token; do
+            [[ -n "$token" ]] && merged_extra_args+=("$token")
+        done < <(split_shell_words "$profile_extra_args")
+    fi
+    if [[ ${#merged_extra_args[@]} -gt 0 ]]; then
+        final_args+=("${merged_extra_args[@]}")
     fi
     # Add remaining args
     if [[ ${#args[@]} -gt 0 ]]; then

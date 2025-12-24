@@ -1,0 +1,4 @@
+[settings]
+provider = "anthropic"
+extra_args = "--dangerously-skip-permissions"
+model = "claude-3-5-sonnet"

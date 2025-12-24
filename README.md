@@ -34,6 +34,26 @@ claude config edit default
 Profile and provider can also be specified via the `CLAUDE_PROFILE`,
 `CLAUDE_PROVIDER`, and `CLAUDE_MODEL` environment variables.
 
+### Extra CLI Arguments
+
+Both the global config (`~/.config/claude-wrapper/config.toml`) and each profile
+may append additional flags to every command. Set them via:
+
+```sh
+# Apply to every invocation
+claude config global set extra_args "--allow-dangerously-skip-permissions"
+
+# Profile-only arguments (e.g., a YOLO profile)
+claude config profile create yolo
+claude config profile use yolo
+claude config set extra_args "--dangerously-skip-permissions"
+```
+
+Global and profile values are additive; if you run the commands above the wrapper
+always includes `--allow-dangerously-skip-permissions`, and only the `yolo`
+profile adds the stronger `--dangerously-skip-permissions`. Sample config files
+live under `config-example/` to help you bootstrap new setups.
+
 ### Custom OpenRouter Keys
 
 The wrapper can use OpenRouter API keys that differ from the global
